@@ -16,7 +16,7 @@
 
 #include "access/am.h"
 #include "planner/cost.h"
-#include <tsearch/ts_utils.h>
+#include "tsearch/ts_utils.h"
 
 /* Relation options - initialized in mod.c */
 extern relopt_kind tp_relopt_kind;
