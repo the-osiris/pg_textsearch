@@ -27,14 +27,14 @@ typedef struct TpScanOpaqueData
 	MemoryContext scan_context; /* Memory context for scan */
 
 	/* Query processing state */
-	char	 *query_text;	/* Search query text */
-	TpVector *query_vector; /* Original query vector from ORDER BY */
+	char		 *query_text;	 /* Search query text */
+	TpVector	 *query_vector;	 /* Original query vector from ORDER BY */
 	TSQuery		  boolean_query; /* Query from an ordinary @@ scan key */
 	MemoryContext boolean_context;
 	bool		  is_boolean_scan;
 	bool		  boolean_recheck;
 	BufFile		 *boolean_results;
-	Oid		  index_oid;	/* Index OID */
+	Oid			  index_oid; /* Index OID */
 
 	/* Scan results state */
 	ItemPointer result_ctids;  /* Array of matching CTIDs */
