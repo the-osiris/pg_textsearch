@@ -258,6 +258,8 @@ WHERE body @@ to_tsquery('english', 'alpha <-> beta');
 RESET enable_seqscan;
 DROP TABLE boolean_segment_docs;
 
+SET default_text_search_config = 'pg_catalog.simple';
+
 CREATE TABLE boolean_prefix_docs (
     id integer PRIMARY KEY,
     body text NOT NULL
@@ -322,12 +324,16 @@ RESET client_min_messages;
 
 SET enable_seqscan = off;
 
+\pset format unaligned
 SELECT count(*) AS broad_prefix_matches
 FROM boolean_broad_prefix_docs
 WHERE body @@ to_tsquery('simple', 'broadprefix:*');
+\pset format aligned
 
 RESET enable_seqscan;
 DROP TABLE boolean_broad_prefix_docs;
+
+SET default_text_search_config = 'pg_catalog.english';
 
 CREATE TABLE boolean_seek_docs (
     id integer PRIMARY KEY,
