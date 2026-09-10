@@ -118,6 +118,53 @@ typedef struct TpBooleanSegmentEval
 	uint32				 doc_id;
 } TpBooleanSegmentEval;
 
+static List *tp_boolean_incomplete_warning_seen = NIL;
+
+static bool
+tp_boolean_has_positive_operand(QueryItem *item, bool negated)
+{
+	if (item->type == QI_VAL)
+		return !negated;
+
+	if (item->type != QI_OPR)
+		return false;
+
+	if (item->qoperator.oper == OP_NOT)
+		return tp_boolean_has_positive_operand(item + 1, !negated);
+
+	return tp_boolean_has_positive_operand(item + 1, negated) ||
+		   tp_boolean_has_positive_operand(
+				   item + item->qoperator.left, negated);
+}
+
+static void
+tp_boolean_warn_if_incomplete(
+		Relation index, TpIndexMetaPage metap, TSQuery query)
+{
+	Oid index_oid = RelationGetRelid(index);
+
+	if ((metap->capabilities & TP_METAPAGE_ALL_DOCUMENTS_INDEXED) != 0 ||
+		query->size == 0 ||
+		tp_boolean_has_positive_operand(GETQUERY(query), false) ||
+		list_member_oid(tp_boolean_incomplete_warning_seen, index_oid))
+		return;
+
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+		tp_boolean_incomplete_warning_seen =
+				lappend_oid(tp_boolean_incomplete_warning_seen, index_oid);
+		MemoryContextSwitchTo(old);
+	}
+
+	ereport(WARNING,
+			(errmsg("BM25 index \"%s\" may omit empty or stopword-only "
+					"documents from this purely negative query",
+					RelationGetRelationName(index)),
+			 errhint("Run \"REINDEX INDEX %s;\" for complete results.",
+					 RelationGetRelationName(index))));
+}
+
 static HTAB *
 tp_boolean_create_ctid_set(const char *name, long initial_size)
 {
@@ -810,6 +857,9 @@ tp_boolean_rescan(
 	old_context		  = MemoryContextSwitchTo(so->boolean_context);
 	so->boolean_query = DatumGetTSQueryCopy(keys[0].sk_argument);
 	MemoryContextSwitchTo(old_context);
+
+	tp_boolean_warn_if_incomplete(
+			scan->indexRelation, metap, so->boolean_query);
 }
 
 bool
