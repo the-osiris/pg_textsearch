@@ -14,9 +14,6 @@
 void tp_boolean_rescan(
 		IndexScanDesc scan, ScanKey keys, int nkeys, TpIndexMetaPage metap);
 
-bool tp_boolean_execute(
-		IndexScanDesc	   scan,
-		TpLocalIndexState *index_state,
-		TpIndexMetaPage	   metap);
+bool tp_boolean_execute(IndexScanDesc scan, TpLocalIndexState *index_state);
 
 bool tp_boolean_next(IndexScanDesc scan);

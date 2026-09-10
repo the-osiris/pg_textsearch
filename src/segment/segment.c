@@ -93,6 +93,47 @@ tp_segment_read_dict_entry(
 	}
 }
 
+bool
+tp_segment_read_next(Relation index, BlockNumber root, BlockNumber *next)
+{
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	Buffer		buffer;
+	Page		page;
+	uint32		magic;
+	uint32		version;
+
+	Assert(next != NULL);
+	if (root >= nblocks)
+		return false;
+
+	buffer = ReadBuffer(index, root);
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buffer);
+	memcpy(&magic, PageGetContents(page), sizeof(magic));
+	memcpy(&version,
+		   (char *)PageGetContents(page) + sizeof(magic),
+		   sizeof(version));
+
+	if (magic != TP_SEGMENT_MAGIC || version < TP_SEGMENT_FORMAT_VERSION_3 ||
+		version > TP_SEGMENT_FORMAT_VERSION)
+	{
+		UnlockReleaseBuffer(buffer);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid segment header at block %u", root)));
+	}
+
+	if (version <= TP_SEGMENT_FORMAT_VERSION_3)
+		*next = ((TpSegmentHeaderV3 *)PageGetContents(page))->next_segment;
+	else if (version == TP_SEGMENT_FORMAT_VERSION_4)
+		*next = ((TpSegmentHeaderV4 *)PageGetContents(page))->next_segment;
+	else
+		*next = ((TpSegmentHeader *)PageGetContents(page))->next_segment;
+
+	UnlockReleaseBuffer(buffer);
+	return true;
+}
+
 /*
  * Open segment for reading.
  * If load_ctids is true, preloads all CTID arrays into memory (expensive).

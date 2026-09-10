@@ -97,7 +97,7 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
 # SQL regression tests
-test: test-compaction-ownercheck test-compaction-request-source
+test: test-compaction-ownercheck test-compaction-request-source test-boolean-lock
 	@echo "Running SQL regression tests..."
 	@$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS)
 
@@ -107,10 +107,13 @@ test-compaction-ownercheck:
 test-compaction-request-source:
 	@./test/scripts/compaction_request_source.sh
 
+test-boolean-lock:
+	@./test/scripts/boolean_lock_source.sh
+
 # These guards cover invariants the SQL suite cannot observe, so they must
 # gate every way the suite is run, not just `make test`.
-installcheck: test-compaction-ownercheck test-compaction-request-source
-test-local: test-compaction-ownercheck test-compaction-request-source
+installcheck: test-compaction-ownercheck test-compaction-request-source test-boolean-lock
+test-local: test-compaction-ownercheck test-compaction-request-source test-boolean-lock
 
 # Custom local test target with dedicated PostgreSQL instance
 test-local: install
@@ -141,6 +144,7 @@ clean-test-dirs:
 test-concurrency:
 	@echo "Running concurrency tests..."
 	@cd test/scripts && ./concurrency.sh
+	@cd test/scripts && ./boolean_concurrent_merge.sh
 	@cd test/scripts && ./partial_concurrent_read.sh
 	@cd test/scripts && ./concurrent_duplicate_read.sh
 	@cd test/scripts && ./vacuum_concurrent_merge.sh
@@ -394,4 +398,4 @@ help:
 	@echo "  make test-all"
 	@echo "  make format"
 
-.PHONY: test test-compaction-ownercheck test-compaction-request-source clean-test-dirs installcheck test-concurrency test-recovery test-segment test-stress test-cic test-chinese test-replication test-replication-extended test-logical-replication test-multi-index test-reindex test-shell test-all expected lint-format format format-check format-diff format-single coverage coverage-build coverage-clean coverage-report help
+.PHONY: test test-compaction-ownercheck test-compaction-request-source test-boolean-lock clean-test-dirs installcheck test-concurrency test-recovery test-segment test-stress test-cic test-chinese test-replication test-replication-extended test-logical-replication test-multi-index test-reindex test-shell test-all expected lint-format format format-check format-diff format-single coverage coverage-build coverage-clean coverage-report help

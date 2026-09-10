@@ -512,7 +512,6 @@ tp_gettuple(IndexScanDesc scan, ScanDirection dir)
 		{
 			TpLocalIndexState *index_state = tp_get_local_index_state(
 					RelationGetRelid(scan->indexRelation));
-			TpIndexMetaPage metap;
 
 			if (!index_state)
 				ereport(ERROR,
@@ -520,19 +519,11 @@ tp_gettuple(IndexScanDesc scan, ScanDirection dir)
 						 errmsg("could not get index state for BM25 "
 								"Boolean search")));
 
-			tp_acquire_index_lock(index_state, LW_SHARED);
-			metap = tp_get_metapage(scan->indexRelation);
-
-			if (!tp_boolean_execute(scan, index_state, metap))
+			if (!tp_boolean_execute(scan, index_state))
 			{
-				pfree(metap);
-				tp_release_index_lock(index_state);
 				so->eof_reached = true;
 				return false;
 			}
-
-			pfree(metap);
-			tp_release_index_lock(index_state);
 		}
 		else if (!tp_execute_scoring_query(scan))
 		{

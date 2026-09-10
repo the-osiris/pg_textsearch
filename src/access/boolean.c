@@ -118,6 +118,13 @@ typedef struct TpBooleanSegmentEval
 	uint32				 doc_id;
 } TpBooleanSegmentEval;
 
+typedef struct TpBooleanSegmentSnapshot
+{
+	BlockNumber *roots;
+	uint32		 count;
+	uint32		 capacity;
+} TpBooleanSegmentSnapshot;
+
 static List *tp_boolean_incomplete_warning_seen = NIL;
 
 static bool
@@ -307,6 +314,56 @@ tp_boolean_collect_memtable(
 
 		tp_source_free_postings(source, postings);
 	}
+}
+
+static void
+tp_boolean_collect_candidate(ItemPointer candidate, void *arg)
+{
+	HTAB *candidates = arg;
+	bool  found;
+
+	(void)hash_search(candidates, candidate, HASH_ENTER, &found);
+}
+
+static TpBooleanSegmentSnapshot
+tp_boolean_segment_snapshot_create(Relation index, const TpIndexMetaPage metap)
+{
+	TpBooleanSegmentSnapshot snapshot = {0};
+	BlockNumber				 nblocks  = RelationGetNumberOfBlocks(index);
+
+	for (int level = 0; level < TP_MAX_LEVELS; level++)
+	{
+		BlockNumber segment = metap->level_heads[level];
+
+		while (segment != InvalidBlockNumber)
+		{
+			if (snapshot.count >= nblocks)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("BM25 segment chain contains a cycle")));
+			if (snapshot.count == snapshot.capacity)
+			{
+				snapshot.capacity = snapshot.capacity == 0
+										  ? 16
+										  : snapshot.capacity * 2;
+				snapshot.roots =
+						snapshot.roots == NULL
+								? palloc_array(BlockNumber, snapshot.capacity)
+								: repalloc(
+										  snapshot.roots,
+										  snapshot.capacity *
+												  sizeof(BlockNumber));
+			}
+
+			snapshot.roots[snapshot.count++] = segment;
+			if (!tp_segment_read_next(index, segment, &segment))
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("could not open BM25 segment %u", segment)));
+		}
+	}
+
+	return snapshot;
 }
 
 typedef struct TpBooleanCandidateEval
@@ -863,76 +920,87 @@ tp_boolean_rescan(
 }
 
 bool
-tp_boolean_execute(
-		IndexScanDesc	   scan,
-		TpLocalIndexState *index_state,
-		TpIndexMetaPage	   metap)
+tp_boolean_execute(IndexScanDesc scan, TpLocalIndexState *index_state)
 {
-	TpScanOpaque		  so = (TpScanOpaque)scan->opaque;
-	MemoryContext		  old_context;
-	TpBooleanEvalState	  state;
-	const char			**terms;
-	TpDataSource		 *memtable_source;
-	HTAB				 *candidates;
-	HASH_SEQ_STATUS		  sequence;
-	ItemPointer			  candidate;
-	TpBooleanResultWriter writer;
+	TpScanOpaque			 so = (TpScanOpaque)scan->opaque;
+	MemoryContext			 old_context;
+	TpBooleanEvalState		 state;
+	const char			   **terms;
+	TpDataSource			*source;
+	TpIndexMetaPage			 metap;
+	TpBooleanSegmentSnapshot segments;
+	HTAB					*candidates;
+	HASH_SEQ_STATUS			 sequence;
+	ItemPointer				 candidate;
+	TpBooleanResultWriter	 writer;
 
 	if (so->boolean_query == NULL || so->boolean_query->size == 0)
 		return false;
 
+	if (index_state->lock_held)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("BM25 Boolean execution must acquire its own index "
+						"lock")));
+
+	tp_acquire_index_lock(index_state, LW_SHARED);
+	metap = tp_get_metapage(scan->indexRelation);
 	tp_boolean_check_config(scan->indexRelation, metap);
 
-	old_context			= MemoryContextSwitchTo(so->boolean_context);
-	state				= tp_boolean_extract_terms(so->boolean_query);
-	terms				= palloc(state.term_count * sizeof(char *));
-	candidates			= state.requires_all_docs
-								? NULL
-								: tp_boolean_create_ctid_set(
-								  "BM25 Boolean candidates", 1024);
+	old_context = MemoryContextSwitchTo(so->boolean_context);
+	state		= tp_boolean_extract_terms(so->boolean_query);
+	terms		= palloc(state.term_count * sizeof(char *));
+	candidates	= tp_boolean_create_ctid_set("BM25 Boolean candidates", 1024);
 	so->boolean_recheck = state.requires_recheck;
 
 	for (int i = 0; i < state.term_count; i++)
 		terms[i] = state.terms[i].lexeme;
 
-	memtable_source = tp_memtable_source_create_for_read(
+	source = tp_memtable_source_create_for_read(
 			index_state, scan->indexRelation, terms, state.term_count);
-	tp_boolean_collect_memtable(&state, memtable_source, candidates);
+	tp_boolean_collect_memtable(
+			&state, source, state.requires_all_docs ? NULL : candidates);
+	if (state.requires_all_docs && source != NULL)
+		tp_source_foreach_document(
+				source, tp_boolean_collect_candidate, candidates);
+	segments = tp_boolean_segment_snapshot_create(scan->indexRelation, metap);
+
+	if (source != NULL)
+		tp_source_close(source);
+	pfree(metap);
+
+	/*
+	 * Compaction can replace these roots after the lock is released, but it
+	 * parks every displaced segment on the tombstone chain with the
+	 * publishing transaction's FullTransactionId.  VACUUM cannot recycle
+	 * those pages until the scan's transaction snapshot is older than that
+	 * xid, so the captured immutable roots remain readable for this scan.
+	 */
+	tp_release_index_lock(index_state);
 
 	writer.query = &state;
 	writer.file	 = BufFileCreateTemp(false);
 	writer.count = 0;
 
-	if (state.requires_all_docs)
+	hash_seq_init(&sequence, candidates);
+	while ((candidate = hash_seq_search(&sequence)) != NULL)
+		tp_boolean_write_candidate(candidate, &writer);
+
+	for (uint32 i = 0; i < segments.count; i++)
 	{
-		if (memtable_source != NULL)
-			tp_source_foreach_document(
-					memtable_source, tp_boolean_write_candidate, &writer);
+		TpSegmentReader *reader = tp_segment_open_ex(
+				scan->indexRelation, segments.roots[i], false);
+
+		if (reader == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("could not open BM25 segment %u",
+							segments.roots[i])));
+		tp_boolean_write_segment(reader, &writer);
+		tp_segment_close(reader);
 	}
-	else
-	{
-		hash_seq_init(&sequence, candidates);
-		while ((candidate = hash_seq_search(&sequence)) != NULL)
-			tp_boolean_write_candidate(candidate, &writer);
-	}
-
-	if (memtable_source != NULL)
-		tp_source_close(memtable_source);
-
-	for (int level = 0; level < TP_MAX_LEVELS; level++)
-	{
-		BlockNumber segment = metap->level_heads[level];
-
-		while (segment != InvalidBlockNumber)
-		{
-			TpSegmentReader *reader =
-					tp_segment_open_ex(scan->indexRelation, segment, false);
-
-			tp_boolean_write_segment(reader, &writer);
-			segment = reader->header->next_segment;
-			tp_segment_close(reader);
-		}
-	}
+	if (segments.roots != NULL)
+		pfree(segments.roots);
 
 	so->boolean_results = writer.file;
 	so->result_count	= writer.count;
