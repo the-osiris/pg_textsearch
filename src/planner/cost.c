@@ -19,42 +19,49 @@
 #include <utils/rel.h>
 #include <utils/selfuncs.h>
 
+#include "access/boolean.h"
 #include "constants.h"
 #include "index/limit.h"
 #include "index/metapage.h"
 #include "planner/cost.h"
 
 static bool
-tp_boolean_query_requires_full_scan(IndexPath *path)
+tp_boolean_get_constant_query(IndexPath *path, TSQuery *query)
 {
 	IndexClause *index_clause;
 	OpExpr		*clause;
 	Node		*query_node;
 	Const		*query_const;
-	TSQuery		 query;
-	QueryItem	*items;
 
 	index_clause = linitial_node(IndexClause, path->indexclauses);
 	if (index_clause->rinfo == NULL ||
 		!IsA(index_clause->rinfo->clause, OpExpr))
-		return true;
+		return false;
 
 	clause = castNode(OpExpr, index_clause->rinfo->clause);
 	if (list_length(clause->args) != 2)
-		return true;
+		return false;
 
 	query_node = lsecond(clause->args);
 	while (query_node != NULL && IsA(query_node, RelabelType))
 		query_node = (Node *)castNode(RelabelType, query_node)->arg;
 
 	if (query_node == NULL || !IsA(query_node, Const))
-		return true;
+		return false;
 
 	query_const = castNode(Const, query_node);
 	if (query_const->constisnull || query_const->consttype != TSQUERYOID)
-		return true;
+		return false;
 
-	query = DatumGetTSQuery(query_const->constvalue);
+	*query = DatumGetTSQuery(query_const->constvalue);
+	return true;
+}
+
+static bool
+tp_boolean_query_requires_full_scan(TSQuery query)
+{
+	QueryItem *items;
+
 	if (query->size == 0)
 		return false;
 
@@ -174,6 +181,7 @@ tp_costestimate(
 	bool			has_orderby		  = path->indexorderbys != NIL;
 	bool			has_boolean		  = path->indexclauses != NIL;
 	bool			boolean_full_scan = false;
+	TSQuery			boolean_query	  = NULL;
 
 	/*
 	 * Boolean filtering and ranked scans are separate execution modes.
@@ -193,7 +201,26 @@ tp_costestimate(
 	}
 
 	if (has_boolean)
-		boolean_full_scan = tp_boolean_query_requires_full_scan(path);
+	{
+		if (!tp_boolean_get_constant_query(path, &boolean_query))
+			boolean_full_scan = true;
+		else if (
+				tp_boolean_query_exact_operand_count(boolean_query) >
+				TP_BOOLEAN_MAX_EXACT_OPERANDS)
+		{
+			tp_disable_index_path(
+					path,
+					indexStartupCost,
+					indexTotalCost,
+					indexSelectivity,
+					indexCorrelation,
+					indexPages);
+			return;
+		}
+		else
+			boolean_full_scan = tp_boolean_query_requires_full_scan(
+					boolean_query);
+	}
 
 	/* Check for LIMIT clause and verify it can be safely pushed down */
 	if (has_orderby && root && root->limit_tuples > 0 &&
@@ -263,12 +290,12 @@ tp_costestimate(
 	genericcostestimate(root, path, loop_count, &costs);
 
 	/* Override with BM25-specific estimates */
-	*indexTotalCost = boolean_full_scan
-						  ? costs.indexTotalCost +
-									cpu_operator_cost * num_tuples
-						  : costs.indexTotalCost * TP_INDEX_SCAN_COST_FACTOR;
-	*indexStartupCost =
-			has_boolean ? *indexTotalCost : costs.indexStartupCost + 0.01;
+	*indexTotalCost	  = boolean_full_scan
+							  ? costs.indexTotalCost +
+										cpu_operator_cost * num_tuples
+							  : costs.indexTotalCost * TP_INDEX_SCAN_COST_FACTOR;
+	*indexStartupCost = has_boolean ? *indexTotalCost
+									: costs.indexStartupCost + 0.01;
 
 	/*
 	 * Calculate selectivity based on LIMIT if available, otherwise default

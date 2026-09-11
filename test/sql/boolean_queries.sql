@@ -475,4 +475,73 @@ RESET enable_seqscan;
 RESET pg_textsearch.bulk_load_threshold;
 RESET pg_textsearch.memtable_pages_threshold;
 DROP TABLE boolean_memtable_stream_docs;
+
+CREATE TABLE boolean_many_term_docs (
+    id integer PRIMARY KEY,
+    body text NOT NULL
+);
+
+INSERT INTO boolean_many_term_docs
+SELECT document, query.body
+FROM generate_series(1, 1000) AS document
+CROSS JOIN (
+    SELECT string_agg(format('term%s', term), ' ') AS body
+    FROM generate_series(1, 201) AS term
+) AS query;
+
+SET pg_textsearch.compress_segments = off;
+SET client_min_messages = WARNING;
+CREATE INDEX boolean_many_term_docs_body_idx
+    ON boolean_many_term_docs USING bm25(body)
+    WITH (text_config = 'simple');
+RESET client_min_messages;
+RESET pg_textsearch.compress_segments;
+
+CREATE FUNCTION pg_temp.boolean_and_query(term_count integer)
+RETURNS tsquery
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+    SELECT string_agg(format('term%s', term), ' & ')::tsquery
+    FROM generate_series(1, term_count) AS term
+$$;
+
+CREATE FUNCTION pg_temp.boolean_repeated_or_query(term_count integer)
+RETURNS tsquery
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+    SELECT string_agg('term1', ' | ')::tsquery
+    FROM generate_series(1, term_count)
+$$;
+
+SET default_text_search_config = 'pg_catalog.simple';
+SELECT pg_temp.boolean_and_query(64)::text AS query \gset exact_limit_
+SELECT pg_temp.boolean_and_query(201)::text AS query \gset oversized_
+SELECT pg_temp.boolean_repeated_or_query(65)::text AS query \gset repeated_
+
+\pset format unaligned
+SELECT pg_temp.first_plan_child(format(
+    'SELECT count(*) FROM boolean_many_term_docs WHERE body @@ %L::tsquery',
+    :'oversized_query'
+)) = 'Seq Scan' AS oversized_boolean_falls_back;
+SELECT pg_temp.first_plan_child(format(
+    'SELECT count(*) FROM boolean_many_term_docs WHERE body @@ %L::tsquery',
+    :'repeated_query'
+)) = 'Seq Scan' AS repeated_boolean_falls_back;
+
+SET enable_seqscan = off;
+SELECT pg_temp.first_plan_child(format(
+    'SELECT count(*) FROM boolean_many_term_docs WHERE body @@ %L::tsquery',
+    :'exact_limit_query'
+)) = 'Index Scan' AS exact_operand_limit_uses_index;
+SELECT count(*) = 1000 AS exact_operand_limit_succeeds
+FROM boolean_many_term_docs
+WHERE body @@ :'exact_limit_query'::tsquery;
+RESET enable_seqscan;
+\pset format aligned
+DROP TABLE boolean_many_term_docs;
+
 DROP EXTENSION pg_textsearch;

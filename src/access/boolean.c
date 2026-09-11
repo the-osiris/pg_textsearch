@@ -35,6 +35,7 @@ typedef struct TpBooleanEvalState
 	TSQuery			 query;
 	TpBooleanTerm	*terms;
 	int				 term_count;
+	int				 exact_operand_count;
 	ItemPointerData *memtable_docs;
 	uint32			 memtable_doc_count;
 	uint32			 memtable_total_docs;
@@ -266,6 +267,7 @@ tp_boolean_extract_terms(TSQuery query)
 	memset(&state, 0, sizeof(state));
 	state.query = query;
 	state.terms = palloc0(Max(query->size, 1) * sizeof(TpBooleanTerm));
+	state.exact_operand_count = tp_boolean_query_exact_operand_count(query);
 
 	for (int i = 0; i < query->size; i++)
 	{
@@ -306,6 +308,22 @@ tp_boolean_extract_terms(TSQuery query)
 	}
 
 	return state;
+}
+
+int
+tp_boolean_query_exact_operand_count(TSQuery query)
+{
+	QueryItem *items = GETQUERY(query);
+	int		   count = 0;
+
+	for (int i = 0; i < query->size; i++)
+	{
+		if (items[i].type == QI_VAL && !items[i].qoperand.prefix &&
+			items[i].qoperand.weight == 0)
+			count++;
+	}
+
+	return count;
 }
 
 static int
@@ -1209,17 +1227,26 @@ tp_boolean_execute(IndexScanDesc scan, TpLocalIndexState *index_state)
 				 errmsg("BM25 Boolean execution must acquire its own index "
 						"lock")));
 
-	tp_acquire_index_lock(index_state, LW_SHARED);
-	metap = tp_get_metapage(scan->indexRelation);
-	tp_boolean_check_config(scan->indexRelation, metap);
-
-	old_context			= MemoryContextSwitchTo(so->boolean_context);
-	state				= tp_boolean_extract_terms(so->boolean_query);
+	old_context = MemoryContextSwitchTo(so->boolean_context);
+	state		= tp_boolean_extract_terms(so->boolean_query);
+	if (state.exact_operand_count > TP_BOOLEAN_MAX_EXACT_OPERANDS)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("BM25 Boolean queries support at most %d exact term "
+						"operands",
+						TP_BOOLEAN_MAX_EXACT_OPERANDS),
+				 errdetail(
+						 "Query contains %d exact term operands.",
+						 state.exact_operand_count)));
 	terms				= palloc(state.term_count * sizeof(char *));
 	so->boolean_recheck = state.requires_recheck;
 
 	for (int i = 0; i < state.term_count; i++)
 		terms[i] = state.terms[i].lexeme;
+
+	tp_acquire_index_lock(index_state, LW_SHARED);
+	metap = tp_get_metapage(scan->indexRelation);
+	tp_boolean_check_config(scan->indexRelation, metap);
 
 	source = tp_memtable_source_create_for_read(
 			index_state, scan->indexRelation, terms, state.term_count);
