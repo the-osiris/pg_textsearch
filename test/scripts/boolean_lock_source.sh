@@ -53,7 +53,7 @@ snapshot_line="$(unique_line "tp_boolean_segment_snapshot_create")"
 close_line="$(unique_line "tp_source_close(source)")"
 release_line="$(unique_line "tp_release_index_lock(index_state)")"
 candidate_write_line="$(
-    unique_line "tp_boolean_write_candidate(candidate, &writer)"
+    unique_line "tp_boolean_write_candidate(&candidate, &writer)"
 )"
 segment_write_line="$(unique_line "tp_boolean_write_segment")"
 

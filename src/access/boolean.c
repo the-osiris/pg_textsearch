@@ -11,7 +11,6 @@
 #include <tsearch/ts_cache.h>
 #include <tsearch/ts_utils.h>
 #include <utils/fmgrprotos.h>
-#include <utils/hsearch.h>
 #include <utils/memutils.h>
 
 #include "access/am.h"
@@ -25,19 +24,63 @@
 
 typedef struct TpBooleanTerm
 {
-	char *lexeme;
-	int	  length;
-	HTAB *ctids;
+	char			*lexeme;
+	int				 length;
+	ItemPointerData *ctids;
+	uint32			 ctid_count;
 } TpBooleanTerm;
 
 typedef struct TpBooleanEvalState
 {
-	TSQuery		   query;
-	TpBooleanTerm *terms;
-	int			   term_count;
-	bool		   requires_recheck;
-	bool		   requires_all_docs;
+	TSQuery			 query;
+	TpBooleanTerm	*terms;
+	int				 term_count;
+	ItemPointerData *memtable_docs;
+	uint32			 memtable_doc_count;
+	uint32			 memtable_total_docs;
+	bool			 requires_recheck;
 } TpBooleanEvalState;
+
+typedef enum TpBooleanMemtableCandidateKind
+{
+	TP_BOOLEAN_MEMTABLE_CANDIDATE_ALL,
+	TP_BOOLEAN_MEMTABLE_CANDIDATE_TERM,
+	TP_BOOLEAN_MEMTABLE_CANDIDATE_UNION,
+} TpBooleanMemtableCandidateKind;
+
+typedef struct TpBooleanMemtableCandidateStream
+{
+	TpBooleanMemtableCandidateKind kind;
+	uint64						   estimate;
+	bool						   requires_all_docs;
+
+	union
+	{
+		struct
+		{
+			TpBooleanEvalState *query;
+			uint32				position;
+		} all;
+
+		struct
+		{
+			TpBooleanTerm *term;
+			uint32		   position;
+		} term;
+
+		struct
+		{
+			struct TpBooleanMemtableCandidateStream *left;
+			struct TpBooleanMemtableCandidateStream *right;
+			ItemPointerData							 left_ctid;
+			ItemPointerData							 right_ctid;
+			bool									 left_loaded;
+			bool									 right_loaded;
+			bool									 left_valid;
+			bool									 right_valid;
+		} union_stream;
+	} state;
+} TpBooleanMemtableCandidateStream;
 
 typedef enum TpBooleanCandidateKind
 {
@@ -172,20 +215,6 @@ tp_boolean_warn_if_incomplete(
 					 RelationGetRelationName(index))));
 }
 
-static HTAB *
-tp_boolean_create_ctid_set(const char *name, long initial_size)
-{
-	HASHCTL ctl;
-
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize	  = sizeof(ItemPointerData);
-	ctl.entrysize = sizeof(ItemPointerData);
-	ctl.hcxt	  = CurrentMemoryContext;
-
-	return hash_create(
-			name, initial_size, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-}
-
 static void
 tp_boolean_check_config(Relation index, TpIndexMetaPage metap)
 {
@@ -263,8 +292,7 @@ tp_boolean_extract_terms(TSQuery query)
 			 */
 			if (operand->prefix || operand->weight != 0)
 			{
-				state.requires_recheck	= true;
-				state.requires_all_docs = true;
+				state.requires_recheck = true;
 				continue;
 			}
 
@@ -274,29 +302,40 @@ tp_boolean_extract_terms(TSQuery query)
 			term		 = &state.terms[state.term_count++];
 			term->length = operand->length;
 			term->lexeme = pnstrdup(lexeme, operand->length);
-			term->ctids =
-					tp_boolean_create_ctid_set("BM25 Boolean term CTIDs", 256);
 		}
 	}
-
-	state.requires_all_docs |= !tsquery_requires_match(GETQUERY(query));
 
 	return state;
 }
 
-static void
-tp_boolean_add_ctid(TpBooleanTerm *term, HTAB *candidates, ItemPointer ctid)
+static int
+tp_boolean_compare_ctids(const void *left, const void *right)
 {
-	bool found;
+	return ItemPointerCompare((ItemPointer)left, (ItemPointer)right);
+}
 
-	(void)hash_search(term->ctids, ctid, HASH_ENTER, &found);
-	if (candidates != NULL)
-		(void)hash_search(candidates, ctid, HASH_ENTER, &found);
+static uint32
+tp_boolean_sort_unique_ctids(ItemPointerData *ctids, uint32 count)
+{
+	uint32 unique_count;
+
+	if (count < 2)
+		return count;
+
+	qsort(ctids, count, sizeof(*ctids), tp_boolean_compare_ctids);
+	unique_count = 1;
+	for (uint32 i = 1; i < count; i++)
+	{
+		if (ItemPointerCompare(&ctids[unique_count - 1], &ctids[i]) != 0)
+			ctids[unique_count++] = ctids[i];
+	}
+
+	return unique_count;
 }
 
 static void
-tp_boolean_collect_memtable(
-		TpBooleanEvalState *state, TpDataSource *source, HTAB *candidates)
+tp_boolean_collect_memtable_terms(
+		TpBooleanEvalState *state, TpDataSource *source)
 {
 	if (source == NULL)
 		return;
@@ -309,20 +348,57 @@ tp_boolean_collect_memtable(
 		if (postings == NULL)
 			continue;
 
-		for (int j = 0; j < postings->count; j++)
-			tp_boolean_add_ctid(term, candidates, &postings->ctids[j]);
-
+		term->ctids = postings->ctids;
+		term->ctid_count =
+				tp_boolean_sort_unique_ctids(term->ctids, postings->count);
+		postings->ctids = NULL;
 		tp_source_free_postings(source, postings);
 	}
 }
 
-static void
-tp_boolean_collect_candidate(ItemPointer candidate, void *arg)
+typedef struct TpBooleanDocumentCollector
 {
-	HTAB *candidates = arg;
-	bool  found;
+	ItemPointerData *ctids;
+	uint32			 count;
+	uint32			 capacity;
+} TpBooleanDocumentCollector;
 
-	(void)hash_search(candidates, candidate, HASH_ENTER, &found);
+static void
+tp_boolean_collect_document(ItemPointer ctid, void *arg)
+{
+	TpBooleanDocumentCollector *collector = arg;
+
+	if (collector->count == collector->capacity)
+	{
+		collector->capacity = collector->capacity == 0
+									? 256
+									: collector->capacity * 2;
+		collector->ctids =
+				collector->ctids == NULL
+						? palloc_array(ItemPointerData, collector->capacity)
+						: repalloc(
+								  collector->ctids,
+								  collector->capacity *
+										  sizeof(ItemPointerData));
+	}
+
+	collector->ctids[collector->count++] = *ctid;
+}
+
+static void
+tp_boolean_collect_memtable_documents(
+		TpBooleanEvalState *state, TpDataSource *source)
+{
+	TpBooleanDocumentCollector collector = {0};
+
+	if (source == NULL)
+		return;
+
+	tp_source_foreach_document(
+			source, tp_boolean_collect_document, &collector);
+	state->memtable_docs = collector.ctids;
+	state->memtable_doc_count =
+			tp_boolean_sort_unique_ctids(collector.ctids, collector.count);
 }
 
 static TpBooleanSegmentSnapshot
@@ -392,10 +468,25 @@ tp_boolean_candidate_has_term(
 		return TS_MAYBE;
 
 	Assert(term != NULL);
-	if (hash_search(term->ctids, eval->ctid, HASH_FIND, NULL) == NULL)
-		return TS_NO;
+	{
+		uint32 low	= 0;
+		uint32 high = term->ctid_count;
 
-	return data == NULL ? TS_YES : TS_MAYBE;
+		while (low < high)
+		{
+			uint32 mid = low + (high - low) / 2;
+			int	   cmp = ItemPointerCompare(&term->ctids[mid], eval->ctid);
+
+			if (cmp < 0)
+				low = mid + 1;
+			else if (cmp > 0)
+				high = mid;
+			else
+				return data == NULL ? TS_YES : TS_MAYBE;
+		}
+	}
+
+	return TS_NO;
 }
 
 static bool
@@ -411,6 +502,183 @@ tp_boolean_candidate_matches(TpBooleanEvalState *state, ItemPointer candidate)
 				   &eval,
 				   TS_EXEC_PHRASE_NO_POS,
 				   tp_boolean_candidate_has_term) != TS_NO;
+}
+
+static void tp_boolean_free_memtable_candidate_stream(
+		TpBooleanMemtableCandidateStream *stream);
+
+static TpBooleanMemtableCandidateStream *
+tp_boolean_create_memtable_all_stream(TpBooleanEvalState *state)
+{
+	TpBooleanMemtableCandidateStream *stream = palloc0(sizeof(*stream));
+
+	stream->kind			  = TP_BOOLEAN_MEMTABLE_CANDIDATE_ALL;
+	stream->estimate		  = state->memtable_total_docs;
+	stream->requires_all_docs = true;
+	stream->state.all.query	  = state;
+	return stream;
+}
+
+static TpBooleanMemtableCandidateStream *
+tp_boolean_create_memtable_candidate_stream(
+		TpBooleanEvalState *state, QueryItem *item)
+{
+	TpBooleanMemtableCandidateStream *stream;
+
+	if (item->type == QI_VAL)
+	{
+		QueryOperand  *operand = &item->qoperand;
+		const char	  *lexeme  = GETOPERAND(state->query) + operand->distance;
+		TpBooleanTerm *term;
+
+		if (operand->prefix || operand->weight != 0)
+			return tp_boolean_create_memtable_all_stream(state);
+
+		term = tp_boolean_find_term(state, lexeme, operand->length);
+		Assert(term != NULL);
+
+		stream					= palloc0(sizeof(*stream));
+		stream->kind			= TP_BOOLEAN_MEMTABLE_CANDIDATE_TERM;
+		stream->estimate		= term->ctid_count;
+		stream->state.term.term = term;
+		return stream;
+	}
+
+	if (item->type != QI_OPR)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid item in BM25 Boolean query")));
+
+	if (item->qoperator.oper == OP_NOT)
+		return tp_boolean_create_memtable_all_stream(state);
+
+	{
+		TpBooleanMemtableCandidateStream *right =
+				tp_boolean_create_memtable_candidate_stream(state, item + 1);
+		TpBooleanMemtableCandidateStream *left =
+				tp_boolean_create_memtable_candidate_stream(
+						state, item + item->qoperator.left);
+
+		if (item->qoperator.oper == OP_AND ||
+			item->qoperator.oper == OP_PHRASE)
+		{
+			bool choose_left = left->estimate < right->estimate ||
+							   (left->estimate == right->estimate &&
+								(!left->requires_all_docs ||
+								 right->requires_all_docs));
+
+			if (choose_left)
+			{
+				tp_boolean_free_memtable_candidate_stream(right);
+				return left;
+			}
+
+			tp_boolean_free_memtable_candidate_stream(left);
+			return right;
+		}
+
+		if (item->qoperator.oper != OP_OR)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid operator in BM25 Boolean query")));
+
+		stream		 = palloc0(sizeof(*stream));
+		stream->kind = TP_BOOLEAN_MEMTABLE_CANDIDATE_UNION;
+		stream->estimate =
+				Min((uint64)state->memtable_total_docs,
+					left->estimate + right->estimate);
+		stream->requires_all_docs = left->requires_all_docs ||
+									right->requires_all_docs;
+		stream->state.union_stream.left	 = left;
+		stream->state.union_stream.right = right;
+		return stream;
+	}
+}
+
+static bool
+tp_boolean_memtable_candidate_stream_next(
+		TpBooleanMemtableCandidateStream *stream, ItemPointerData *ctid)
+{
+	switch (stream->kind)
+	{
+	case TP_BOOLEAN_MEMTABLE_CANDIDATE_ALL:
+		if (stream->state.all.position >=
+			stream->state.all.query->memtable_doc_count)
+			return false;
+		*ctid = stream->state.all.query
+						->memtable_docs[stream->state.all.position++];
+		return true;
+
+	case TP_BOOLEAN_MEMTABLE_CANDIDATE_TERM:
+		if (stream->state.term.position >= stream->state.term.term->ctid_count)
+			return false;
+		*ctid = stream->state.term.term->ctids[stream->state.term.position++];
+		return true;
+
+	case TP_BOOLEAN_MEMTABLE_CANDIDATE_UNION:
+	{
+		TpBooleanMemtableCandidateStream *left =
+				stream->state.union_stream.left;
+		TpBooleanMemtableCandidateStream *right =
+				stream->state.union_stream.right;
+
+		if (!stream->state.union_stream.left_loaded)
+		{
+			stream->state.union_stream.left_valid =
+					tp_boolean_memtable_candidate_stream_next(
+							left, &stream->state.union_stream.left_ctid);
+			stream->state.union_stream.left_loaded = true;
+		}
+		if (!stream->state.union_stream.right_loaded)
+		{
+			stream->state.union_stream.right_valid =
+					tp_boolean_memtable_candidate_stream_next(
+							right, &stream->state.union_stream.right_ctid);
+			stream->state.union_stream.right_loaded = true;
+		}
+
+		if (!stream->state.union_stream.left_valid &&
+			!stream->state.union_stream.right_valid)
+			return false;
+
+		if (!stream->state.union_stream.right_valid ||
+			(stream->state.union_stream.left_valid &&
+			 ItemPointerCompare(
+					 &stream->state.union_stream.left_ctid,
+					 &stream->state.union_stream.right_ctid) <= 0))
+			*ctid = stream->state.union_stream.left_ctid;
+		else
+			*ctid = stream->state.union_stream.right_ctid;
+
+		if (stream->state.union_stream.left_valid &&
+			ItemPointerEquals(&stream->state.union_stream.left_ctid, ctid))
+			stream->state.union_stream.left_loaded = false;
+		if (stream->state.union_stream.right_valid &&
+			ItemPointerEquals(&stream->state.union_stream.right_ctid, ctid))
+			stream->state.union_stream.right_loaded = false;
+		return true;
+	}
+	}
+
+	pg_unreachable();
+}
+
+static void
+tp_boolean_free_memtable_candidate_stream(
+		TpBooleanMemtableCandidateStream *stream)
+{
+	if (stream == NULL)
+		return;
+
+	if (stream->kind == TP_BOOLEAN_MEMTABLE_CANDIDATE_UNION)
+	{
+		tp_boolean_free_memtable_candidate_stream(
+				stream->state.union_stream.left);
+		tp_boolean_free_memtable_candidate_stream(
+				stream->state.union_stream.right);
+	}
+
+	pfree(stream);
 }
 
 static TpBooleanCandidateStream *
@@ -922,17 +1190,16 @@ tp_boolean_rescan(
 bool
 tp_boolean_execute(IndexScanDesc scan, TpLocalIndexState *index_state)
 {
-	TpScanOpaque			 so = (TpScanOpaque)scan->opaque;
-	MemoryContext			 old_context;
-	TpBooleanEvalState		 state;
-	const char			   **terms;
-	TpDataSource			*source;
-	TpIndexMetaPage			 metap;
-	TpBooleanSegmentSnapshot segments;
-	HTAB					*candidates;
-	HASH_SEQ_STATUS			 sequence;
-	ItemPointer				 candidate;
-	TpBooleanResultWriter	 writer;
+	TpScanOpaque					  so = (TpScanOpaque)scan->opaque;
+	MemoryContext					  old_context;
+	TpBooleanEvalState				  state;
+	const char						**terms;
+	TpDataSource					 *source;
+	TpIndexMetaPage					  metap;
+	TpBooleanSegmentSnapshot		  segments;
+	TpBooleanResultWriter			  writer;
+	bool							  has_memtable;
+	TpBooleanMemtableCandidateStream *memtable_stream = NULL;
 
 	if (so->boolean_query == NULL || so->boolean_query->size == 0)
 		return false;
@@ -947,10 +1214,9 @@ tp_boolean_execute(IndexScanDesc scan, TpLocalIndexState *index_state)
 	metap = tp_get_metapage(scan->indexRelation);
 	tp_boolean_check_config(scan->indexRelation, metap);
 
-	old_context = MemoryContextSwitchTo(so->boolean_context);
-	state		= tp_boolean_extract_terms(so->boolean_query);
-	terms		= palloc(state.term_count * sizeof(char *));
-	candidates	= tp_boolean_create_ctid_set("BM25 Boolean candidates", 1024);
+	old_context			= MemoryContextSwitchTo(so->boolean_context);
+	state				= tp_boolean_extract_terms(so->boolean_query);
+	terms				= palloc(state.term_count * sizeof(char *));
 	so->boolean_recheck = state.requires_recheck;
 
 	for (int i = 0; i < state.term_count; i++)
@@ -958,11 +1224,16 @@ tp_boolean_execute(IndexScanDesc scan, TpLocalIndexState *index_state)
 
 	source = tp_memtable_source_create_for_read(
 			index_state, scan->indexRelation, terms, state.term_count);
-	tp_boolean_collect_memtable(
-			&state, source, state.requires_all_docs ? NULL : candidates);
-	if (state.requires_all_docs && source != NULL)
-		tp_source_foreach_document(
-				source, tp_boolean_collect_candidate, candidates);
+	has_memtable = source != NULL;
+	if (has_memtable)
+	{
+		state.memtable_total_docs = source->total_docs;
+		tp_boolean_collect_memtable_terms(&state, source);
+		memtable_stream = tp_boolean_create_memtable_candidate_stream(
+				&state, GETQUERY(state.query));
+		if (memtable_stream->requires_all_docs)
+			tp_boolean_collect_memtable_documents(&state, source);
+	}
 	segments = tp_boolean_segment_snapshot_create(scan->indexRelation, metap);
 
 	if (source != NULL)
@@ -982,9 +1253,15 @@ tp_boolean_execute(IndexScanDesc scan, TpLocalIndexState *index_state)
 	writer.file	 = BufFileCreateTemp(false);
 	writer.count = 0;
 
-	hash_seq_init(&sequence, candidates);
-	while ((candidate = hash_seq_search(&sequence)) != NULL)
-		tp_boolean_write_candidate(candidate, &writer);
+	if (has_memtable)
+	{
+		ItemPointerData candidate;
+
+		while (tp_boolean_memtable_candidate_stream_next(
+				memtable_stream, &candidate))
+			tp_boolean_write_candidate(&candidate, &writer);
+		tp_boolean_free_memtable_candidate_stream(memtable_stream);
+	}
 
 	for (uint32 i = 0; i < segments.count; i++)
 	{

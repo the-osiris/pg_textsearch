@@ -577,4 +577,73 @@ galloping_seek_matches
 \pset format aligned
 RESET enable_seqscan;
 DROP TABLE boolean_seek_docs;
+CREATE TABLE boolean_memtable_stream_docs (
+    id integer PRIMARY KEY,
+    body text NOT NULL
+);
+SET client_min_messages = WARNING;
+CREATE INDEX boolean_memtable_stream_docs_body_idx
+    ON boolean_memtable_stream_docs USING bm25(body)
+    WITH (text_config = 'english');
+RESET client_min_messages;
+SET pg_textsearch.bulk_load_threshold = 0;
+SET pg_textsearch.memtable_pages_threshold = 0;
+INSERT INTO boolean_memtable_stream_docs
+SELECT id,
+       concat_ws(' ',
+           CASE WHEN id % 2 = 0 THEN 'common' END,
+           CASE WHEN id % 997 = 0 OR id = 5001 THEN 'anchor' END,
+           CASE WHEN id = 5001 THEN 'alternative' END,
+           'ubiquitous')
+FROM generate_series(1, 5001) AS id;
+SET enable_seqscan = off;
+\pset format unaligned
+SELECT array_agg(id ORDER BY id) AS memtable_selective_and_matches
+FROM boolean_memtable_stream_docs
+WHERE body @@ to_tsquery('english', 'anchor & common');
+memtable_selective_and_matches
+{1994,3988}
+(1 row)
+SELECT array_agg(id ORDER BY id) AS memtable_nested_matches
+FROM boolean_memtable_stream_docs
+WHERE body @@ to_tsquery(
+    'english', 'anchor & (common | alternative)');
+memtable_nested_matches
+{1994,3988,5001}
+(1 row)
+SELECT array_agg(id ORDER BY id) AS memtable_anchored_not_matches
+FROM boolean_memtable_stream_docs
+WHERE body @@ to_tsquery('english', 'anchor & !common');
+memtable_anchored_not_matches
+{997,2991,4985,5001}
+(1 row)
+SELECT count(*) AS memtable_nested_not_matches
+FROM boolean_memtable_stream_docs
+WHERE body @@ to_tsquery(
+    'english', '(alternative | !common) & ubiquitous');
+memtable_nested_not_matches
+2501
+(1 row)
+\pset format aligned
+SET pg_textsearch.memtable_cache_enabled = off;
+\pset format unaligned
+SELECT array_agg(id ORDER BY id) AS chain_selective_and_matches
+FROM boolean_memtable_stream_docs
+WHERE body @@ to_tsquery('english', 'anchor & common');
+chain_selective_and_matches
+{1994,3988}
+(1 row)
+SELECT count(*) AS chain_nested_not_matches
+FROM boolean_memtable_stream_docs
+WHERE body @@ to_tsquery(
+    'english', '(alternative | !common) & ubiquitous');
+chain_nested_not_matches
+2501
+(1 row)
+\pset format aligned
+RESET pg_textsearch.memtable_cache_enabled;
+RESET enable_seqscan;
+RESET pg_textsearch.bulk_load_threshold;
+RESET pg_textsearch.memtable_pages_threshold;
+DROP TABLE boolean_memtable_stream_docs;
 DROP EXTENSION pg_textsearch;
