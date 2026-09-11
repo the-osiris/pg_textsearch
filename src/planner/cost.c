@@ -132,6 +132,28 @@ tp_seed_limit_for_filter(PlannerInfo *root, IndexPath *path, int user_limit)
 	return (int)seeded;
 }
 
+static void
+tp_disable_index_path(
+		IndexPath	*path,
+		Cost		*indexStartupCost,
+		Cost		*indexTotalCost,
+		Selectivity *indexSelectivity,
+		double		*indexCorrelation,
+		double		*indexPages)
+{
+#if PG_VERSION_NUM >= 180000
+	/* A fallback can add a disabled sequential scan and sort. */
+	path->path.disabled_nodes += 3;
+#else
+	(void)path;
+#endif
+	*indexStartupCost = 0.0;
+	*indexTotalCost	  = get_float8_infinity();
+	*indexSelectivity = 1.0;
+	*indexCorrelation = 0.0;
+	*indexPages		  = 0.0;
+}
+
 /*
  * Estimate cost of BM25 index scan
  */
@@ -160,8 +182,13 @@ tp_costestimate(
 	if ((!has_orderby && !has_boolean) || (has_orderby && has_boolean) ||
 		(has_boolean && list_length(path->indexclauses) != 1))
 	{
-		*indexStartupCost = get_float8_infinity();
-		*indexTotalCost	  = get_float8_infinity();
+		tp_disable_index_path(
+				path,
+				indexStartupCost,
+				indexTotalCost,
+				indexSelectivity,
+				indexCorrelation,
+				indexPages);
 		return;
 	}
 
@@ -210,8 +237,13 @@ tp_costestimate(
 			{
 				pfree(metap);
 				index_close(index_rel, AccessShareLock);
-				*indexStartupCost = get_float8_infinity();
-				*indexTotalCost	  = get_float8_infinity();
+				tp_disable_index_path(
+						path,
+						indexStartupCost,
+						indexTotalCost,
+						indexSelectivity,
+						indexCorrelation,
+						indexPages);
 				return;
 			}
 

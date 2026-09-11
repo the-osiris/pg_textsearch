@@ -45,6 +45,46 @@ WHERE body @@ to_tsquery('english', 'refund & fraud');
    Index Cond: (body @@ '''refund'' & ''fraud'''::tsquery)
 (2 rows)
 
+CREATE FUNCTION pg_temp.first_plan_child(query text)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    plan json;
+BEGIN
+    EXECUTE 'EXPLAIN (FORMAT JSON, COSTS OFF) ' || query INTO plan;
+    RETURN plan->0->'Plan'->'Plans'->0->>'Node Type';
+END
+$$;
+CREATE TEMP TABLE boolean_other (id integer);
+INSERT INTO boolean_other SELECT generate_series(1, 9);
+\pset format unaligned
+SET enable_sort = off;
+SELECT pg_temp.first_plan_child($query$
+    SELECT id
+    FROM boolean_docs
+    WHERE body @@ to_tsquery('english', 'refund')
+    ORDER BY body <@> to_bm25query('refund', 'boolean_docs_body_idx')
+    LIMIT 1
+$query$) = 'Sort' AS unsupported_path_falls_back;
+unsupported_path_falls_back
+t
+(1 row)
+SET enable_nestloop = off;
+SELECT pg_temp.first_plan_child($query$
+    SELECT d.id
+    FROM boolean_docs d
+    JOIN boolean_other other ON other.id = d.id
+    WHERE d.body @@ to_tsquery('english', 'refund')
+    ORDER BY d.body <@> to_bm25query('refund', 'boolean_docs_body_idx')
+    LIMIT 1
+$query$) = 'Sort' AS unsupported_join_path_falls_back;
+unsupported_join_path_falls_back
+t
+(1 row)
+RESET enable_nestloop;
+RESET enable_sort;
+\pset format aligned
 SELECT id
 FROM boolean_docs
 WHERE body @@ to_tsquery('english', 'refund & fraud')
