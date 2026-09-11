@@ -263,11 +263,12 @@ tp_costestimate(
 	genericcostestimate(root, path, loop_count, &costs);
 
 	/* Override with BM25-specific estimates */
-	*indexStartupCost = costs.indexStartupCost + 0.01;
-	*indexTotalCost	  = boolean_full_scan
-							  ? costs.indexTotalCost +
-										cpu_operator_cost * num_tuples
-							  : costs.indexTotalCost * TP_INDEX_SCAN_COST_FACTOR;
+	*indexTotalCost = boolean_full_scan
+						  ? costs.indexTotalCost +
+									cpu_operator_cost * num_tuples
+						  : costs.indexTotalCost * TP_INDEX_SCAN_COST_FACTOR;
+	*indexStartupCost =
+			has_boolean ? *indexTotalCost : costs.indexStartupCost + 0.01;
 
 	/*
 	 * Calculate selectivity based on LIMIT if available, otherwise default
@@ -275,6 +276,10 @@ tp_costestimate(
 	if (boolean_full_scan)
 	{
 		*indexSelectivity = 1.0;
+	}
+	else if (has_boolean)
+	{
+		*indexSelectivity = TP_DEFAULT_INDEX_SELECTIVITY;
 	}
 	else if (
 			root && root->limit_tuples > 0 && root->limit_tuples < INT_MAX &&

@@ -390,6 +390,17 @@ CREATE INDEX boolean_seek_docs_body_idx
     WITH (text_config = 'english');
 RESET client_min_messages;
 
+ANALYZE boolean_seek_docs;
+
+\pset format unaligned
+SELECT pg_temp.first_plan_child($query$
+    SELECT id
+    FROM boolean_seek_docs
+    WHERE body @@ to_tsquery('english', 'common')
+    LIMIT 1
+$query$) = 'Seq Scan' AS boolean_limit_avoids_materializing_index;
+\pset format aligned
+
 SET enable_seqscan = off;
 
 \pset format unaligned
