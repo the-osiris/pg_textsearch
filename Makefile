@@ -97,7 +97,7 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
 # SQL regression tests
-test: test-compaction-ownercheck test-compaction-request-source test-boolean-lock test-boolean-memory
+test: test-compaction-ownercheck test-compaction-request-source test-boolean-lock test-boolean-memory test-boolean-rescan
 	@echo "Running SQL regression tests..."
 	@$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS)
 
@@ -113,10 +113,13 @@ test-boolean-lock:
 test-boolean-memory:
 	@./test/scripts/boolean_memory_source.sh
 
+test-boolean-rescan:
+	@./test/scripts/boolean_rescan_source.sh
+
 # These guards cover invariants the SQL suite cannot observe, so they must
 # gate every way the suite is run, not just `make test`.
-installcheck: test-compaction-ownercheck test-compaction-request-source test-boolean-lock test-boolean-memory
-test-local: test-compaction-ownercheck test-compaction-request-source test-boolean-lock test-boolean-memory
+installcheck: test-compaction-ownercheck test-compaction-request-source test-boolean-lock test-boolean-memory test-boolean-rescan
+test-local: test-compaction-ownercheck test-compaction-request-source test-boolean-lock test-boolean-memory test-boolean-rescan
 
 # Custom local test target with dedicated PostgreSQL instance
 test-local: install

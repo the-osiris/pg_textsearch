@@ -297,6 +297,9 @@ tp_rescan(
 		/* Clean up any previous results */
 		tp_rescan_cleanup_results(so);
 
+		/* Release scratch allocations from the previous Boolean execution. */
+		MemoryContextReset(so->boolean_context);
+
 		/* Drop the emitted-CTID dedup set from any prior scan */
 		tp_returned_ctids_reset(so);
 
@@ -305,9 +308,21 @@ tp_rescan(
 		so->result_count	= 0;
 		so->eof_reached		= false;
 		so->query_vector	= NULL;
-		so->boolean_query	= NULL;
-		so->is_boolean_scan = false;
-		so->boolean_recheck = false;
+
+		/*
+		 * NULL keys restart the scan with its previous keys.  Only discard
+		 * the copied Boolean query when PostgreSQL supplies replacements.
+		 */
+		if (keys != NULL)
+		{
+			if (so->boolean_query != NULL)
+			{
+				pfree(so->boolean_query);
+				so->boolean_query = NULL;
+			}
+			so->is_boolean_scan = false;
+			so->boolean_recheck = false;
+		}
 	}
 
 	if (nkeys > 0 && keys && so)

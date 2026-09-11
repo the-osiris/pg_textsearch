@@ -1169,7 +1169,6 @@ tp_boolean_rescan(
 				 errmsg("BM25 Boolean scans require exactly one @@ "
 						"condition")));
 
-	MemoryContextReset(so->boolean_context);
 	so->boolean_query	= NULL;
 	so->is_boolean_scan = true;
 	so->boolean_recheck = false;
@@ -1179,7 +1178,7 @@ tp_boolean_rescan(
 
 	tp_boolean_check_config(scan->indexRelation, metap);
 
-	old_context		  = MemoryContextSwitchTo(so->boolean_context);
+	old_context		  = MemoryContextSwitchTo(so->scan_context);
 	so->boolean_query = DatumGetTSQueryCopy(keys[0].sk_argument);
 	MemoryContextSwitchTo(old_context);
 
