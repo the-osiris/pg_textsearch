@@ -8,7 +8,7 @@
  * Strings are stored in DSA memory and referenced by dsa_pointer
  * keys.  Provides concurrent term lookup with a variant key that
  * compares char* (for lookup) and dsa_pointer (for storage) under
- * the same hash function.  See docs/memtable_cache.md.
+ * the same hash function.
  */
 #include <postgres.h>
 
@@ -132,7 +132,7 @@ tp_string_table_create(dsa_area *area)
 	params.hash_function	= tp_string_hash_function;
 	params.compare_function = tp_string_compare_function;
 	params.copy_function	= tp_string_copy_function;
-	params.tranche_id		= TP_STRING_HASH_TRANCHE_ID;
+	params.tranche_id		= tp_tranche_id(TP_STRING_HASH_TRANCHE_ID);
 
 	/* Create the dshash table */
 	return dshash_create(area, &params, area);
@@ -154,7 +154,7 @@ tp_string_table_attach(dsa_area *area, dshash_table_handle handle)
 	params.hash_function	= tp_string_hash_function;
 	params.compare_function = tp_string_compare_function;
 	params.copy_function	= tp_string_copy_function;
-	params.tranche_id		= TP_STRING_HASH_TRANCHE_ID;
+	params.tranche_id		= tp_tranche_id(TP_STRING_HASH_TRANCHE_ID);
 
 	/* Attach to the dshash table */
 	return dshash_attach(area, &params, handle, area);

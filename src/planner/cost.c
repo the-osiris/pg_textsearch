@@ -8,6 +8,7 @@
 
 #include <access/genam.h>
 #include <catalog/pg_type_d.h>
+#include <limits.h>
 #include <math.h>
 #include <nodes/pathnodes.h>
 #include <nodes/primnodes.h>

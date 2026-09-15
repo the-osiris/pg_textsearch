@@ -25,10 +25,13 @@
  */
 #include <postgres.h>
 
+#include <access/genam.h>
 #include <access/generic_xlog.h>
+#include <access/htup_details.h>
 #include <access/relation.h>
 #include <access/transam.h>
 #include <catalog/index.h>
+#include <catalog/pg_type.h>
 #include <fmgr.h>
 #include <funcapi.h>
 #include <miscadmin.h>
@@ -43,6 +46,7 @@
 #include <utils/relcache.h>
 #include <utils/varlena.h>
 
+#include "compat.h"
 #include "constants.h"
 #include "index/freepage.h"
 #include "index/metapage.h"
@@ -675,8 +679,7 @@ tp_memtable_append(
  * GenericXLog record.  GenericXLog allows up to 4 buffers; we
  * use at most 2 (meta + segment header).
  *
- * In-memory memtable cache integration (docs/memtable_cache.md
- * §"Spill detection", §"Spill consumption from cache"):
+ * In-memory memtable cache integration:
  *
  *   1. Before touching the metapage we bump
  *      `state->shared->spill_generation` so that any reader
@@ -785,7 +788,7 @@ tp_spill_finalize(
 	/*
 	 * Step 2: drop the in-memory cache's dshash tables.
 	 *
-	 * Lock order (docs/memtable_cache.md §"Lock order"):
+	 * Lock order:
 	 *   per-index LWLock EXCL  (held by the caller, blocks all
 	 *                           readers / catchup paths)
 	 *     -> cache.apply_lock  (no other holder is possible, since
@@ -892,8 +895,9 @@ tp_memtable_mark_continuation_chain_dead(
 
 /*
  * Mark every page in the spilled memtable chain DEAD (outer walk +
- * fragment continuation sub-chains).  See docs/memtable_v2.md spill
- * step 4.  Does not free blocks; amvacuumcleanup recycles later.
+ * fragment continuation sub-chains) after spill publication.  Does
+ * not free blocks; amvacuumcleanup recycles them later.  See
+ * ARCHITECTURE.md, "Spill and Compaction".
  */
 void
 tp_memtable_mark_chain_dead(
@@ -1603,6 +1607,8 @@ bm25_memtable_chain(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, 3, "free_offset", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, 4, "next_block", INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, 5, "flags", INT4OID, -1, 0);
+		/* Hand-built TupleDescs must be finalized before use (PG19+). */
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 		funcctx->user_fctx	= state;
 
@@ -1665,7 +1671,8 @@ bm25_memtable_chain(PG_FUNCTION_ARGS)
 
 /*
  * Dead-orphan SRF.  Scans index blocks after the metapage and
- * returns one row per memtable page stamped DEAD by spill (step 4).
+ * returns one row per memtable page stamped DEAD after spill
+ * publication.
  */
 PG_FUNCTION_INFO_V1(bm25_memtable_dead_pages);
 
@@ -1702,6 +1709,8 @@ bm25_memtable_dead_pages(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, 2, "flags", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, 3, "dead_fxid", INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, 4, "n_records", INT4OID, -1, 0);
+		/* Hand-built TupleDescs must be finalized before use (PG19+). */
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 		funcctx->user_fctx	= state;
 

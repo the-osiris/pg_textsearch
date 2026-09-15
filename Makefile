@@ -97,7 +97,9 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
 # SQL regression tests
-test: test-compaction-ownercheck test-compaction-request-source test-boolean-lock test-boolean-memory test-boolean-rescan
+test: test-compaction-ownercheck test-compaction-request-source \
+	test-segment-io-limits test-boolean-lock test-boolean-memory \
+	test-boolean-rescan
 	@echo "Running SQL regression tests..."
 	@$(pg_regress_installcheck) $(REGRESS_OPTS) $(REGRESS)
 
@@ -116,10 +118,25 @@ test-boolean-memory:
 test-boolean-rescan:
 	@./test/scripts/boolean_rescan_source.sh
 
+test-segment-io-limits:
+	@set -e; tmp_dir="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmp_dir"' EXIT; \
+	$(CC) -std=gnu11 \
+		-Isrc \
+		-I"$$($(PG_CONFIG) --includedir-server)" \
+		-I"$$($(PG_CONFIG) --includedir)" \
+		test/scripts/segment_io_limits_test.c \
+		-o "$$tmp_dir/segment_io_limits_test"; \
+	"$$tmp_dir/segment_io_limits_test"
+
 # These guards cover invariants the SQL suite cannot observe, so they must
 # gate every way the suite is run, not just `make test`.
-installcheck: test-compaction-ownercheck test-compaction-request-source test-boolean-lock test-boolean-memory test-boolean-rescan
-test-local: test-compaction-ownercheck test-compaction-request-source test-boolean-lock test-boolean-memory test-boolean-rescan
+installcheck: test-compaction-ownercheck test-compaction-request-source \
+	test-segment-io-limits test-boolean-lock test-boolean-memory \
+	test-boolean-rescan
+test-local: test-compaction-ownercheck test-compaction-request-source \
+	test-segment-io-limits test-boolean-lock test-boolean-memory \
+	test-boolean-rescan
 
 # Custom local test target with dedicated PostgreSQL instance
 test-local: install
@@ -404,4 +421,4 @@ help:
 	@echo "  make test-all"
 	@echo "  make format"
 
-.PHONY: test test-compaction-ownercheck test-compaction-request-source test-boolean-lock clean-test-dirs installcheck test-concurrency test-recovery test-segment test-stress test-cic test-chinese test-replication test-replication-extended test-logical-replication test-multi-index test-reindex test-shell test-all expected lint-format format format-check format-diff format-single coverage coverage-build coverage-clean coverage-report help
+.PHONY: test test-compaction-ownercheck test-compaction-request-source test-segment-io-limits test-boolean-lock test-boolean-memory test-boolean-rescan clean-test-dirs installcheck test-concurrency test-recovery test-segment test-stress test-cic test-chinese test-replication test-replication-extended test-logical-replication test-multi-index test-reindex test-shell test-all expected lint-format format format-check format-diff format-single coverage coverage-build coverage-clean coverage-report help

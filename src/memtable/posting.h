@@ -10,7 +10,6 @@
  * records; queried by the cache TpDataSource.  The doclength
  * hash entry (TpDocLengthEntry) is colocated here because the
  * doclength table API + DSA storage are owned by this module.
- * See docs/memtable_cache.md.
  */
 #pragma once
 
@@ -21,6 +20,7 @@
 #include <utils/dsa.h>
 #include <utils/hsearch.h>
 
+#include "constants.h"
 #include "index/state.h"
 #include "memtable/posting_entry.h"
 
@@ -65,8 +65,8 @@ extern void tp_add_document_to_posting_list(
 		ItemPointer		   ctid,
 		int32			   frequency);
 
-/* Document length hash table tranche ID */
-#define TP_DOCLENGTH_HASH_TRANCHE_ID (LWTRANCHE_FIRST_USER_DEFINED + 1)
+/* Document length hash table tranche ID (part of the fixed block) */
+#define TP_DOCLENGTH_HASH_TRANCHE_ID TP_TRANCHE_DOC_LENGTHS
 
 /*
  * Reserve a doc-length slot for `ctid`. Returns true if newly
