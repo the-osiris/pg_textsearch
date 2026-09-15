@@ -29,10 +29,17 @@ if grep -Fq "tp_acquire_index_lock" <<<"${gettuple_body}"; then
     exit 1
 fi
 
-if ! grep -Fq "tp_boolean_segment_snapshot_create" <<<"${execute_body}" ||
-    ! grep -Fq "tp_source_close(source)" <<<"${execute_body}" ||
+if ! grep -Fq "tp_memtable_chain_snapshot_capture" <<<"${execute_body}" ||
+    ! grep -Fq "tp_boolean_segment_snapshot_create" <<<"${execute_body}" ||
     ! grep -Fq "tp_release_index_lock(index_state)" <<<"${execute_body}"; then
     echo "Boolean execution does not snapshot mutable sources before unlocking" >&2
+    exit 1
+fi
+
+if grep -Eq \
+    "tp_memtable_source_create_for_read|tp_source_get_postings|tp_source_foreach_document" \
+    <<<"${execute_body}"; then
+    echo "Boolean execution still materializes the memtable source" >&2
     exit 1
 fi
 
@@ -49,20 +56,30 @@ unique_line() {
 }
 
 acquire_line="$(unique_line "tp_acquire_index_lock(index_state, LW_SHARED)")"
+memtable_snapshot_line="$(
+    unique_line "tp_memtable_chain_snapshot_capture"
+)"
 snapshot_line="$(unique_line "tp_boolean_segment_snapshot_create")"
-close_line="$(unique_line "tp_source_close(source)")"
 release_line="$(unique_line "tp_release_index_lock(index_state)")"
-candidate_write_line="$(
-    unique_line "tp_boolean_write_candidate(&candidate, &writer)"
+memtable_write_line="$(
+    unique_line "tp_boolean_write_memtable_snapshot"
 )"
 segment_write_line="$(unique_line "tp_boolean_write_segment")"
 
-if [[ "${acquire_line}" -ge "${snapshot_line}" ||
-      "${snapshot_line}" -ge "${close_line}" ||
-      "${close_line}" -ge "${release_line}" ||
-      "${release_line}" -ge "${candidate_write_line}" ||
+if [[ "${acquire_line}" -ge "${memtable_snapshot_line}" ||
+      "${memtable_snapshot_line}" -ge "${snapshot_line}" ||
+      "${snapshot_line}" -ge "${release_line}" ||
+      "${release_line}" -ge "${memtable_write_line}" ||
       "${release_line}" -ge "${segment_write_line}" ]]; then
     echo "Boolean candidate evaluation still runs under the per-index LWLock" >&2
+    exit 1
+fi
+
+if ! grep -Fq "stream->state.term.iterator.force_copy = true" \
+        "${BOOLEAN_SOURCE}" ||
+    ! grep -Fq "cursors[i].iterator.force_copy = true" \
+        "${BOOLEAN_SOURCE}"; then
+    echo "Boolean exact-term iterators can retain buffer LWLocks" >&2
     exit 1
 fi
 

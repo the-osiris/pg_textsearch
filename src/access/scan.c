@@ -304,10 +304,10 @@ tp_rescan(
 		tp_returned_ctids_reset(so);
 
 		/* Reset scan position and state */
-		so->current_pos		= 0;
-		so->result_count	= 0;
-		so->eof_reached		= false;
-		so->query_vector	= NULL;
+		so->current_pos	 = 0;
+		so->result_count = 0;
+		so->eof_reached	 = false;
+		so->query_vector = NULL;
 
 		/*
 		 * NULL keys restart the scan with its previous keys.  Only discard

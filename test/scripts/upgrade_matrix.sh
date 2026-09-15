@@ -305,6 +305,17 @@ run_boolean_completeness_upgrade() {
     fail "1.4.0/boolean: anchored query count != 1"
   rm -f "$out" "$err_f"
 
+  out="$(mktemp)"; err_f="$(mktemp)"
+  run_capture "SET enable_seqscan=off;
+    SELECT count(*) FROM d
+    WHERE c @@ to_tsquery('english', 'alpha | !missing');" "$out" "$err_f"
+  if grep -qi 'REINDEX' "$err_f" && [ "$(tr -d '[:space:]' <"$out")" = "1" ]; then
+    log "  [1.4.0/boolean] mixed negative query warned and continued"
+  else
+    fail "1.4.0/boolean: expected mixed negative warning and count 1, got stdout=[$(cat "$out")] stderr=[$(head -1 "$err_f")]"
+  fi
+  rm -f "$out" "$err_f"
+
   runsql "REINDEX INDEX i;"
   out="$(mktemp)"; err_f="$(mktemp)"
   run_capture "SET enable_seqscan=off;

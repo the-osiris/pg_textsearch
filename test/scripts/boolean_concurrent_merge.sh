@@ -104,7 +104,11 @@ writer() {
             SET pg_textsearch.segments_per_level=64;
             INSERT INTO docs (body)
             SELECT 'common writer ${batch} ' || gs
-            FROM generate_series(1, 100) gs;
+            FROM generate_series(1, 100) gs" \
+            >>"${ERR_DIR}/writer.log" 2>&1
+        sleep 0.01
+        "${PSQL[@]}" -c "
+            SET pg_textsearch.segments_per_level=64;
             SELECT bm25_spill_index('docs_bm25')" \
             >>"${ERR_DIR}/writer.log" 2>&1
     done
@@ -134,7 +138,7 @@ wait "${writer_pid}" || failed=1
 wait "${merger_pid}" || failed=1
 
 if grep -REq \
-    "invalid segment header|could not open BM25 segment|terminated by signal" \
+    "invalid segment header|could not open BM25 segment|memtable chain ended|memtable tail page|terminated by signal" \
     "${ERR_DIR}" "${LOGFILE}"; then
     echo "Boolean scan observed a reclaimed or invalid segment" >&2
     exit 1
